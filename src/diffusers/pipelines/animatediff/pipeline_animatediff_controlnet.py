@@ -940,7 +940,7 @@ class AnimateDiffControlNetPipeline(
         # using the default behaviour (which is to generate different video for each prompt in the list).
         _context_scheduler_provided = context_scheduler is not None
         if not _context_scheduler_provided:
-            context_scheduler = ContextScheduler(length=num_frames, loop=False, type="uniform")
+            context_scheduler = ContextScheduler(length=num_frames, loop=False, type="uniform_constant")
         else:
             batch_size = 1
 
@@ -960,22 +960,71 @@ class AnimateDiffControlNetPipeline(
         text_encoder_lora_scale = (
             cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
         )
-        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
-            prompt,
-            device,
-            num_videos_per_prompt,
-            self.do_classifier_free_guidance,
-            negative_prompt,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            lora_scale=text_encoder_lora_scale,
-            clip_skip=self.clip_skip,
+        prompt_embedding_map = {}
+        for i, p in enumerate(prompt):
+            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+                p,
+                device,
+                num_videos_per_prompt,
+                self.do_classifier_free_guidance,
+                negative_prompt[i] if negative_prompt is not None else None,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                lora_scale=text_encoder_lora_scale,
+                clip_skip=self.clip_skip,
+            )
+            prompt_embedding_map[i] = (prompt_embeds, negative_prompt_embeds)
+        prompt_embedding_linspace = torch.linspace(
+            0, len(prompt_embedding_map) - 1, num_frames, device=device, dtype=prompt_embeds.dtype
         )
-        # For classifier free guidance, we need to do two forward passes.
-        # Here we concatenate the unconditional and text embeddings into a single batch
-        # to avoid doing two forward passes
-        if self.do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
+
+        def get_prompt_embedding(frame_indices: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
+            pe_list, npe_list = [], []
+
+            if _context_scheduler_provided:
+                middle_frame = frame_indices[len(frame_indices) // 2]
+                prompt_index = int(prompt_embedding_linspace[middle_frame].item())
+                print("prompt_index:", prompt_index)
+
+                if prompt_index in prompt_embedding_map.keys():
+                    pe, npe = prompt_embedding_map[prompt_index]
+                else:
+                    # do average between closest left and right prompt embeddings
+                    alpha = prompt_embedding_linspace[middle_frame] - prompt_index
+                    left_pe, left_npe = prompt_embedding_map[prompt_index]
+                    right_pe, right_npe = prompt_embedding_map[prompt_index + 1]
+                    pe = left_pe * (1 - alpha) + right_pe * alpha
+                    npe = left_npe * (1 - alpha) + right_npe * alpha
+
+                pe_list.append(pe)
+                npe_list.append(npe)
+
+                # mean of all prompt embeds in given context indices
+                # total_pe = torch.zeros((1, *prompt_embeds.shape[1:]), device=device, dtype=prompt_embeds.dtype)
+                # total_npe = torch.zeros((1, *prompt_embeds.shape[1:]), device=device, dtype=prompt_embeds.dtype)
+                # for frame_index in frame_indices:
+                #     prompt_index = int(prompt_embedding_linspace[frame_index].item())
+                #     if prompt_index in prompt_embedding_map.keys():
+                #         pe, npe = prompt_embedding_map[prompt_index]
+                #     else:
+                #         alpha = prompt_embedding_linspace[frame_index] - prompt_index
+                #         pe, npe = prompt_embedding_map[prompt_index]
+                #         next_pe, next_npe = prompt_embedding_map[prompt_index + 1]
+                #         pe = pe * (1 - alpha) + next_pe * alpha
+                #         npe = npe * (1 - alpha) + next_npe * alpha
+                #     total_pe += pe
+                #     total_npe += npe
+
+                # pe_list.append(total_pe / len(frame_indices))
+                # npe_list.append(total_npe / len(frame_indices))
+            else:
+                for prompt_embed, negative_prompt_embed in prompt_embedding_map.values():
+                    pe_list.append(prompt_embed)
+                    npe_list.append(negative_prompt_embed)
+
+            pe_list = torch.cat(pe_list)
+            npe_list = torch.cat(npe_list)
+            return pe_list, npe_list
 
         if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
             image_embeds = self.prepare_ip_adapter_image_embeds(
@@ -1077,57 +1126,87 @@ class AnimateDiffControlNetPipeline(
                     latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                    if guess_mode and self.do_classifier_free_guidance:
-                        # Infer ControlNet only for the conditional batch.
-                        control_model_input = latents
-                        control_model_input = self.scheduler.scale_model_input(control_model_input, t)
-                        controlnet_prompt_embeds = prompt_embeds.chunk(2)[1]
-                    else:
-                        control_model_input = latent_model_input
-                        controlnet_prompt_embeds = prompt_embeds
-                    controlnet_prompt_embeds = controlnet_prompt_embeds.repeat_interleave(num_frames, dim=0)
-
-                    if isinstance(controlnet_keep[i], list):
-                        cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
-                    else:
-                        controlnet_cond_scale = controlnet_conditioning_scale
-                        if isinstance(controlnet_cond_scale, list):
-                            controlnet_cond_scale = controlnet_cond_scale[0]
-                        cond_scale = controlnet_cond_scale * controlnet_keep[i]
-
-                    control_model_input = torch.transpose(control_model_input, 1, 2)
-                    control_model_input = control_model_input.reshape(
-                        (-1, control_model_input.shape[2], control_model_input.shape[3], control_model_input.shape[4])
+                    #####
+                    latent_batch_size = latents.shape[0] * (2 if self.do_classifier_free_guidance else 1)
+                    total_noise_preds = torch.zeros(
+                        (latent_batch_size, *latents.shape[1:]), device=device, dtype=latents.dtype
                     )
+                    total_counts = torch.zeros((1, 1, num_frames, 1, 1), device=device, dtype=latents.dtype)
 
-                    down_block_res_samples, mid_block_res_sample = self.controlnet(
-                        control_model_input,
-                        t,
-                        encoder_hidden_states=controlnet_prompt_embeds,
-                        controlnet_cond=conditioning_frames,
-                        conditioning_scale=cond_scale,
-                        guess_mode=guess_mode,
-                        return_dict=False,
-                    )
+                    for context_indices in context_scheduler(num_frames, i, num_inference_steps, generator):
+                        print("context_indices", context_indices)
+                        # expand the latents if we are doing classifier free guidance
+                        context_latents = latents[:, :, context_indices]
+                        latent_model_input = (
+                            torch.cat([context_latents] * 2) if self.do_classifier_free_guidance else context_latents
+                        )
+                        latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                    # predict the noise residual
-                    noise_pred = self.unet(
-                        latent_model_input,
-                        t,
-                        encoder_hidden_states=prompt_embeds,
-                        cross_attention_kwargs=self.cross_attention_kwargs,
-                        added_cond_kwargs=added_cond_kwargs,
-                        down_block_additional_residuals=down_block_res_samples,
-                        mid_block_additional_residual=mid_block_res_sample,
-                    ).sample
+                        context_prompt_embeds, context_negative_prompt_embeds = get_prompt_embedding(context_indices)
+                        if self.do_classifier_free_guidance:
+                            context_prompt_embeds = torch.cat([context_negative_prompt_embeds, context_prompt_embeds])
+                        #####
+                        conditioning_frames_context = [cf[:, context_indices] for cf in conditioning_frames]
+                        if guess_mode and self.do_classifier_free_guidance:
+                            # Infer ControlNet only for the conditional batch.
+                            control_model_input = context_latents
+                            control_model_input = self.scheduler.scale_model_input(control_model_input, t)
+                            controlnet_prompt_embeds = context_prompt_embeds.chunk(2)[1]
+                        else:
+                            control_model_input = latent_model_input
+                            controlnet_prompt_embeds = context_prompt_embeds
+                        controlnet_prompt_embeds = controlnet_prompt_embeds.repeat_interleave(num_frames, dim=0)
+
+                        if isinstance(controlnet_keep[i], list):
+                            cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
+                        else:
+                            controlnet_cond_scale = controlnet_conditioning_scale
+                            if isinstance(controlnet_cond_scale, list):
+                                controlnet_cond_scale = controlnet_cond_scale[0]
+                            cond_scale = controlnet_cond_scale * controlnet_keep[i]
+
+                        control_model_input = torch.transpose(control_model_input, 1, 2)
+                        control_model_input = control_model_input.reshape(
+                            (
+                                -1,
+                                control_model_input.shape[2],
+                                control_model_input.shape[3],
+                                control_model_input.shape[4],
+                            )
+                        )
+
+                        down_block_res_samples, mid_block_res_sample = self.controlnet(
+                            control_model_input,
+                            t,
+                            encoder_hidden_states=controlnet_prompt_embeds,
+                            controlnet_cond=conditioning_frames_context,
+                            conditioning_scale=cond_scale,
+                            guess_mode=guess_mode,
+                            return_dict=False,
+                        )
+
+                        # predict the noise residual
+                        noise_pred = self.unet(
+                            latent_model_input,
+                            t,
+                            encoder_hidden_states=context_prompt_embeds,
+                            cross_attention_kwargs=self.cross_attention_kwargs,
+                            added_cond_kwargs=added_cond_kwargs,
+                            down_block_additional_residuals=down_block_res_samples,
+                            mid_block_additional_residual=mid_block_res_sample,
+                        ).sample
+
+                        total_noise_preds[:, :, context_indices] += noise_pred
+                        total_counts[:, :, context_indices] += 1
 
                     # perform guidance
                     if self.do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        noise_pred_uncond, noise_pred_text = (total_noise_preds / total_counts).chunk(2)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                     # compute the previous noisy sample x_t -> x_t-1
                     latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                    print("latents:", latents.min(), latents.max(), total_counts.squeeze())
 
                     if callback_on_step_end is not None:
                         callback_kwargs = {}
