@@ -17,7 +17,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+import torchvision.transforms.v2.functional as TF
+import numpy as np
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
+from einops import rearrange
+from PIL import Image
 
 from ...image_processor import PipelineImageInput
 from ...loaders import IPAdapterMixin, StableDiffusionLoraLoaderMixin, TextualInversionLoaderMixin
@@ -31,6 +35,7 @@ from ...video_processor import VideoProcessor
 from ..controlnet.multicontrolnet import MultiControlNetModel
 from ..free_init_utils import FreeInitMixin
 from ..pipeline_utils import DiffusionPipeline, StableDiffusionMixin
+from .context_utils import ContextScheduler
 from .pipeline_output import AnimateDiffPipelineOutput
 
 
@@ -256,9 +261,7 @@ class AnimateDiffControlNetPipeline(
             if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
                 text_input_ids, untruncated_ids
             ):
-                removed_text = self.tokenizer.batch_decode(
-                    untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1]
-                )
+                removed_text = self.tokenizer.batch_decode(untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1])
                 logger.warning(
                     "The following part of your input was truncated because CLIP can only handle sequences up to"
                     f" {self.tokenizer.model_max_length} tokens: {removed_text}"
@@ -432,11 +435,56 @@ class AnimateDiffControlNetPipeline(
 
         return ip_adapter_image_embeds
 
+    def encode_latents(self, video, height, width, timestep, generator, encode_batch_size: int = 16, dtype=None):
+
+        if not dtype:
+            dtype = self.unet.dtype
+
+        video = self.video_processor.preprocess_video(video, height=height, width=width).to(device="cuda", dtype=dtype)
+
+        batch_size, channels, num_frames, height, width = video.shape
+
+        video_reshaped = rearrange(video, "b c f h w -> (b f) c h w")
+
+        latents = []
+        for i in range(0, batch_size * num_frames, encode_batch_size):
+            batch_images = video_reshaped[i : i + encode_batch_size]
+            with torch.no_grad():
+                batch_latents = self.vae.encode(batch_images).latent_dist.sample()
+            latents.append(batch_latents)
+
+        latents = torch.cat(latents, dim=0)
+        latents = rearrange(
+            latents,
+            "(b f) c h w -> b c f h w",
+            b=batch_size,
+            f=num_frames,
+        )
+
+        latents = latents * self.vae.config.scaling_factor
+        # self.scheduler.init_noise_sigma
+
+        noise = randn_tensor(latents.shape, generator=generator, device=self.vae.device, dtype=dtype)
+
+        # get latents
+        latents = self.scheduler.add_noise(latents, noise, timestep)
+
+        return latents
+
+    def convert_images_to_tensor(self, images, dtype):
+        tensors = []
+        for img in images:
+            if isinstance(img, np.ndarray):
+                img = Image.fromarray(img)
+            tensors.append(TF.convert_image_dtype(TF.to_image(img), dtype=dtype))
+        return torch.stack(tensors)  # add num_frames dimension, assuming single frame per image
+
     def decode_latents(self, latents, decode_batch_size: int = 16):
         latents = 1 / self.vae.config.scaling_factor * latents
 
         batch_size, channels, num_frames, height, width = latents.shape
-        latents = latents.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, height, width)
+        latents = rearrange(latents, "b c f h w -> (b f) c h w")
+        # latents = latents.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, height, width)
 
         video = []
         for i in range(0, latents.shape[0], decode_batch_size):
@@ -610,7 +658,18 @@ class AnimateDiffControlNetPipeline(
 
     # Copied from diffusers.pipelines.text_to_video_synthesis.pipeline_text_to_video_synth.TextToVideoSDPipeline.prepare_latents
     def prepare_latents(
-        self, batch_size, num_channels_latents, num_frames, height, width, dtype, device, generator, latents=None
+        self,
+        batch_size,
+        num_channels_latents,
+        num_frames,
+        height,
+        width,
+        dtype,
+        device,
+        generator,
+        latents=None,
+        video=None,
+        timestep=None,
     ):
         shape = (
             batch_size,
@@ -626,7 +685,10 @@ class AnimateDiffControlNetPipeline(
             )
 
         if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            if video is None:
+                latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            else:
+                latents = self.encode_latents(video, height=height, width=width, timestep=timestep, generator=generator)
         else:
             latents = latents.to(device)
 
@@ -646,9 +708,7 @@ class AnimateDiffControlNetPipeline(
         do_classifier_free_guidance=False,
         guess_mode=False,
     ):
-        video = self.control_video_processor.preprocess_video(video, height=height, width=width).to(
-            dtype=torch.float32
-        )
+        video = self.control_video_processor.preprocess_video(video, height=height, width=width).to(dtype=torch.float32)
         video = video.permute(0, 2, 1, 3, 4).flatten(0, 1)
         video_batch_size = video.shape[0]
 
@@ -689,13 +749,29 @@ class AnimateDiffControlNetPipeline(
     def num_timesteps(self):
         return self._num_timesteps
 
+    # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.StableDiffusionImg2ImgPipeline.get_timesteps
+    def get_timesteps(self, num_inference_steps, strength):
+        # get the original timestep using init_timestep
+        init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+
+        t_start = max(num_inference_steps - init_timestep, 0)
+        timesteps = self.scheduler.timesteps[t_start * self.scheduler.order :]
+        if hasattr(self.scheduler, "set_begin_index"):
+            self.scheduler.set_begin_index(t_start * self.scheduler.order)
+
+        return timesteps, num_inference_steps - t_start
+
     @torch.no_grad()
     def __call__(
         self,
+        video: Union[
+            List[Union[Image.Image, np.ndarray, torch.tensor]], List[List[Union[Image.Image, np.ndarray, torch.tensor]]]
+        ] = None,
         prompt: Union[str, List[str]] = None,
         num_frames: Optional[int] = 16,
         height: Optional[int] = None,
         width: Optional[int] = None,
+        strength: float = 0.8,
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
         negative_prompt: Optional[Union[str, List[str]]] = None,
@@ -707,6 +783,7 @@ class AnimateDiffControlNetPipeline(
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         ip_adapter_image: Optional[PipelineImageInput] = None,
         ip_adapter_image_embeds: Optional[PipelineImageInput] = None,
+        context_scheduler: Optional[ContextScheduler] = None,
         conditioning_frames: Optional[List[PipelineImageInput]] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
@@ -857,6 +934,16 @@ class AnimateDiffControlNetPipeline(
         else:
             batch_size = prompt_embeds.shape[0]
 
+        # If _context_scheduler_provided is True, it means that the user has provided a custom context scheduler.
+        # When True, it results in pipeline behaving in "long context" mode otherwise "normal" mode.
+        # Long-context mode results in interpolation of the prompt list to match the number of frames, instead of
+        # using the default behaviour (which is to generate different video for each prompt in the list).
+        _context_scheduler_provided = context_scheduler is not None
+        if not _context_scheduler_provided:
+            context_scheduler = ContextScheduler(length=num_frames, loop=False, type="uniform")
+        else:
+            batch_size = 1
+
         device = self._execution_device
 
         if isinstance(controlnet, MultiControlNetModel) and isinstance(controlnet_conditioning_scale, float):
@@ -931,8 +1018,12 @@ class AnimateDiffControlNetPipeline(
             assert False
 
         # 4. Prepare timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
+        if num_inference_steps > 0:
+            self.scheduler.set_timesteps(num_inference_steps, device=device)
+
+            timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength)
+        else:
+            timesteps = []
 
         # 5. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
@@ -946,6 +1037,8 @@ class AnimateDiffControlNetPipeline(
             device,
             generator,
             latents,
+            video,
+            timestep=timesteps[0] if len(timesteps) > 0 else None,
         )
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
