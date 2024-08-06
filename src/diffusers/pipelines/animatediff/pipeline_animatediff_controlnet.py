@@ -596,8 +596,8 @@ class AnimateDiffControlNetPipeline(
         ):
             if not isinstance(video, list) or not isinstance(video[0], list):
                 raise TypeError(f"For multiple controlnets: `image` must be type list of lists but got {type(video)=}")
-            if len(video[0]) != num_frames:
-                raise ValueError(f"Expected length of image sublist as {num_frames} but got {len(video[0])=}")
+            # if len(video[0]) != num_frames:
+            #     raise ValueError(f"Expected length of image sublist as {num_frames} but got {len(video[0])=}")
             if any(len(img) != len(video[0]) for img in video):
                 raise ValueError("All conditioning frame batches for multicontrolnet must be same size")
         else:
@@ -769,6 +769,7 @@ class AnimateDiffControlNetPipeline(
         ] = None,
         prompt: Union[str, List[str]] = None,
         num_frames: Optional[int] = 16,
+        context_length: Optional[int] = 16,
         height: Optional[int] = None,
         width: Optional[int] = None,
         strength: float = 0.8,
@@ -940,7 +941,7 @@ class AnimateDiffControlNetPipeline(
         # using the default behaviour (which is to generate different video for each prompt in the list).
         _context_scheduler_provided = context_scheduler is not None
         if not _context_scheduler_provided:
-            context_scheduler = ContextScheduler(length=num_frames, loop=False, type="uniform_constant")
+            context_scheduler = ContextScheduler(length=context_length, loop=False, type="uniform_constant")
         else:
             batch_size = 1
 
@@ -961,7 +962,7 @@ class AnimateDiffControlNetPipeline(
             cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
         )
         prompt_embedding_map = {}
-        for i, p in enumerate(prompt):
+        for i, p in enumerate([prompt] if isinstance(prompt, str) else prompt):
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(
                 p,
                 device,
@@ -1123,8 +1124,8 @@ class AnimateDiffControlNetPipeline(
             with self.progress_bar(total=self._num_timesteps) as progress_bar:
                 for i, t in enumerate(timesteps):
                     # expand the latents if we are doing classifier free guidance
-                    latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
-                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                    # latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+                    # latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                     #####
                     latent_batch_size = latents.shape[0] * (2 if self.do_classifier_free_guidance else 1)
@@ -1146,7 +1147,11 @@ class AnimateDiffControlNetPipeline(
                         if self.do_classifier_free_guidance:
                             context_prompt_embeds = torch.cat([context_negative_prompt_embeds, context_prompt_embeds])
                         #####
-                        conditioning_frames_context = [cf[:, context_indices] for cf in conditioning_frames]
+
+                        conditioning_frames_context = [
+                            cf[context_indices].repeat(2 if self.do_classifier_free_guidance else 1, 1, 1, 1)
+                            for cf in conditioning_frames
+                        ]
                         if guess_mode and self.do_classifier_free_guidance:
                             # Infer ControlNet only for the conditional batch.
                             control_model_input = context_latents
@@ -1155,7 +1160,9 @@ class AnimateDiffControlNetPipeline(
                         else:
                             control_model_input = latent_model_input
                             controlnet_prompt_embeds = context_prompt_embeds
-                        controlnet_prompt_embeds = controlnet_prompt_embeds.repeat_interleave(num_frames, dim=0)
+                        controlnet_prompt_embeds = controlnet_prompt_embeds.repeat_interleave(
+                            len(context_indices), dim=0
+                        )
 
                         if isinstance(controlnet_keep[i], list):
                             cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
@@ -1166,14 +1173,8 @@ class AnimateDiffControlNetPipeline(
                             cond_scale = controlnet_cond_scale * controlnet_keep[i]
 
                         control_model_input = torch.transpose(control_model_input, 1, 2)
-                        control_model_input = control_model_input.reshape(
-                            (
-                                -1,
-                                control_model_input.shape[2],
-                                control_model_input.shape[3],
-                                control_model_input.shape[4],
-                            )
-                        )
+
+                        control_model_input = rearrange(control_model_input, "b f d h w -> (b f) d h w")
 
                         down_block_res_samples, mid_block_res_sample = self.controlnet(
                             control_model_input,
@@ -1199,6 +1200,7 @@ class AnimateDiffControlNetPipeline(
                         total_noise_preds[:, :, context_indices] += noise_pred
                         total_counts[:, :, context_indices] += 1
 
+                    total_counts[total_counts == 0] = 1
                     # perform guidance
                     if self.do_classifier_free_guidance:
                         noise_pred_uncond, noise_pred_text = (total_noise_preds / total_counts).chunk(2)
